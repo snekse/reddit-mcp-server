@@ -96,6 +96,7 @@ export type RedditComment = {
   readonly permalink: string
   readonly depth?: number
   readonly parentId?: string
+  readonly linkId?: string
 }
 
 export type RedditSubreddit = {
@@ -460,6 +461,7 @@ export type RedditApiCommentTreeData = {
   readonly is_submitter: boolean
   readonly permalink: string
   readonly parent_id: string
+  readonly link_id?: string
   readonly link_title?: string
   readonly replies?:
     | ""

@@ -1163,6 +1163,244 @@ ${searchResults}${nextPageHint(page.after)}${sourceDisclaimer(page)}`
   },
 })
 
+server.addTool({
+  name: "search_reddit_comments",
+  description:
+    "Search inside Reddit comment bodies using the Arctic Shift archive, scoped to a `subreddit` and/or `author`. Read-only; works without credentials. Particularly useful for technical troubleshooting (e.g. searching `r/pinballrepair` for part numbers like 'TIP102', board IDs, or diagnostic fixes that live in replies rather than post titles). Returns matching comments with their parent `post_id` (pass to `get_post_comments` to read the full thread) plus an `after` cursor for paging.",
+  annotations: {
+    title: "Search Reddit Comments",
+    readOnlyHint: true,
+    openWorldHint: true,
+  },
+  parameters: z.object({
+    query: z
+      .string()
+      .describe(
+        "Keywords or phrase to match inside comment bodies (e.g. 'TIP102', 'flipper rebuild', 'EOS switch'). Must be non-empty.",
+      ),
+    subreddit: z
+      .string()
+      .optional()
+      .describe(
+        "Subreddit to search within, without the r/ prefix (e.g. 'pinballrepair'). At least one of `subreddit` or `author` is required.",
+      ),
+    author: z
+      .string()
+      .optional()
+      .describe(
+        "Optional author username filter, without the u/ prefix. At least one of `subreddit` or `author` is required.",
+      ),
+    time_filter: z
+      .enum(["hour", "day", "week", "month", "year", "all"])
+      .default("all")
+      .describe("Restrict to comments from this recent window (e.g. 'year'). Default 'all' (no time limit)."),
+    limit: z.number().min(1).max(100).default(15).describe("How many matching comments to return, 1–100 (default 15)."),
+    after: z
+      .string()
+      .optional()
+      .describe("Forward pagination cursor: the `after` value from a previous call. Omit for the first page."),
+  }),
+  execute: async (args) => {
+    const client = unwrapClient()
+
+    if (args.query.trim() === "") {
+      return toolError("Comment search query cannot be empty")
+    }
+
+    const result = await client.searchComments(args.query, {
+      subreddit: args.subreddit,
+      author: args.author,
+      timeFilter: args.time_filter,
+      limit: args.limit,
+      after: args.after,
+    })
+
+    return result.fold<string | ContentResult>(
+      (err) => toolError(`Failed to search comments: ${err.message}`),
+      (page) => {
+        const comments = page.items
+        const scopeParts = [
+          ...(args.subreddit !== undefined ? [`r/${args.subreddit}`] : []),
+          ...(args.author !== undefined ? [`u/${args.author}`] : []),
+        ]
+        const scopeLabel = scopeParts.length > 0 ? ` in ${scopeParts.join(" by ")}` : ""
+
+        if (comments.length === 0) {
+          return `No comments found matching "${args.query}"${scopeLabel}.`
+        }
+
+        const commentSummaries = comments
+          .map((comment, index) => {
+            const formatted = formatCommentInfo(comment, 600)
+            const flags = [...(comment.edited ? ["*(edited)*"] : []), ...(comment.isSubmitter ? ["**OP**"] : [])]
+            const postIdFromLink = Option(comment.linkId).map((id) => id.replace(/^t3_/, ""))
+            const postIdFromPermalink = Option(/\/comments\/([a-z0-9]+)\//i.exec(comment.permalink)?.[1])
+            const parentPostId = postIdFromLink.or(postIdFromPermalink).orElse("unknown")
+            const titlePart = comment.submissionTitle !== "" ? ` on "${comment.submissionTitle}"` : ""
+
+            return `### ${index + 1}. u/${comment.author} ${flags.join(" ")}
+In r/${comment.subreddit}${titlePart} (Parent \`post_id\`: \`${parentPostId}\`)
+
+> ${formatted.content}
+
+- Posted: ${new Date(comment.createdUtc * 1000).toLocaleString()}
+- Link: ${formatted.link}`
+          })
+          .join("\n\n")
+
+        return `# Reddit Comment Search Results for: "${args.query}"${scopeLabel}
+
+Sorted by: newest first (archive) | Time: ${args.time_filter}
+
+${commentSummaries}${nextPageHint(page.after)}${sourceDisclaimer(page)}`
+      },
+    )
+  },
+})
+
+server.addTool({
+  name: "sync_subreddit_archive",
+  description:
+    "Sync a subreddit's posts and comments from the Arctic Shift archive into the local SQLite FTS5 database (configurable via REDDIT_ARCHIVE_DB or REDDIT_ARCHIVE_DIR) and scan every ingested item for indirect prompt injection, MCP tool poisoning, invisible Unicode smuggling, and malicious shell/URI payloads. Once synced, search_reddit, search_reddit_comments, browse_subreddit (new), get_reddit_post, and get_post_comments serve that subreddit locally in <2ms without hitting the Arctic Shift API.",
+  annotations: {
+    title: "Sync Subreddit to Local Archive",
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: true,
+  },
+  parameters: z.object({
+    subreddit: z
+      .string()
+      .describe("Subreddit to sync locally, without the r/ prefix (e.g. 'PinballRepair', 'PinballFixIt', 'pinball')."),
+    mode: z
+      .enum(["recent", "incremental"])
+      .optional()
+      .describe(
+        "'recent' pages backward from the newest posts/comments; 'incremental' fetches only new items since the last sync. Defaults to 'incremental' if already synced, otherwise 'recent'.",
+      ),
+    max_post_pages: z
+      .number()
+      .min(1)
+      .max(25)
+      .default(3)
+      .describe("Maximum pages of posts to pull (100 posts per page, default 3 = up to 300 posts)."),
+    max_comment_pages: z
+      .number()
+      .min(1)
+      .max(50)
+      .default(5)
+      .describe("Maximum pages of comments to pull (100 comments per page, default 5 = up to 500 comments)."),
+  }),
+  execute: async (args) => {
+    const client = unwrapClient()
+    const result = await client.syncSubredditArchive(args.subreddit, {
+      mode: args.mode,
+      maxPostPages: args.max_post_pages,
+      maxCommentPages: args.max_comment_pages,
+    })
+
+    return result.fold<string | ContentResult>(
+      (err) => toolError(`Failed to sync r/${args.subreddit}: ${err.message}`),
+      (sync) => {
+        const statsLines =
+          sync.stats !== undefined
+            ? [
+                `- Total Cached Posts in r/${sync.subreddit}: ${sync.stats.postCount.toLocaleString()}`,
+                `- Total Cached Comments in r/${sync.subreddit}: ${sync.stats.commentCount.toLocaleString()}`,
+                `- Total Quarantined Items in r/${sync.subreddit}: ${sync.stats.quarantinedCount.toLocaleString()}`,
+              ].join("\n")
+            : ""
+
+        const flaggedNote =
+          sync.flaggedItems.length > 0
+            ? `\n\n## Security Scanner Quarantine Alert\n${sync.flaggedItems.length} item(s) matched prompt-injection or malicious-payload rules and were quarantined (excluded from FTS5 search results and logged to scan-report.json).`
+            : "\n\n## Security Scan\n✓ All ingested posts and comments passed OWASP LLM01 / MCP tool-poisoning / Unicode security checks."
+
+        return `# Synced r/${sync.subreddit} to Local SQLite Archive
+
+- Sync Mode: ${sync.mode}
+- Posts Ingested This Run: ${sync.postsIngested.toLocaleString()}
+- Comments Ingested This Run: ${sync.commentsIngested.toLocaleString()}
+- Quarantined This Run: ${sync.quarantinedCount.toLocaleString()}
+${statsLines}${flaggedNote}`
+      },
+    )
+  },
+})
+
+server.addTool({
+  name: "get_archive_status",
+  description:
+    "Inspect the local SQLite FTS5 Reddit archive: shows the active SQLite driver (bun:sqlite or node:sqlite), configured database and security scan report paths, and per-subreddit cached post, comment, and quarantined item counts.",
+  annotations: {
+    title: "Get Local Archive Status",
+    readOnlyHint: true,
+    openWorldHint: false,
+  },
+  parameters: z.object({}),
+  execute: () => {
+    const client = unwrapClient()
+    return Promise.resolve(
+      client.getArchiveStatus().fold<string | ContentResult>(
+        (err) => toolError(`Failed to read archive status: ${err.message}`),
+        (status) => {
+          const subTable =
+            status.subreddits.length === 0
+              ? "No subreddits cached locally yet. Run `sync_subreddit_archive` to populate."
+              : status.subreddits
+                  .map(
+                    (s) =>
+                      `- **r/${s.subreddit}**: ${s.postCount.toLocaleString()} posts, ${s.commentCount.toLocaleString()} comments (${s.quarantinedCount} quarantined) — last synced ${s.updatedAt}`,
+                  )
+                  .join("\n")
+
+          return `# Local SQLite FTS5 Archive Status
+
+- Database Path: \`${status.dbPath}\`
+- Security Scan Report: \`${status.scanReportPath}\`
+- SQLite Runtime: \`${status.runtime}\`
+- Total Cached Posts: ${status.totalPosts.toLocaleString()}
+- Total Cached Comments: ${status.totalComments.toLocaleString()}
+- Total Quarantined Items: ${status.totalQuarantined.toLocaleString()}
+
+## Cached Subreddits
+${subTable}`
+        },
+      ),
+    )
+  },
+})
+
+server.addTool({
+  name: "scan_reddit_archive",
+  description:
+    "Run a full security audit across all posts and comments stored in the local SQLite archive for OWASP LLM01 indirect prompt injection, MCP tool poisoning, invisible Unicode smuggling (ASCII tags / Bidi overrides), and dangerous shell/URI payloads. Quarantines flagged items from FTS5 search results and writes the full audit report to scan-report.json.",
+  annotations: {
+    title: "Scan Local Reddit Archive for Security Threats",
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  parameters: z.object({}),
+  execute: () => {
+    const client = unwrapClient()
+    return Promise.resolve(
+      client.rescanArchive().fold<string | ContentResult>(
+        (err) => toolError(`Failed to scan archive: ${err.message}`),
+        (res) => `# Local Reddit Archive Security Scan Complete
+
+- Posts Scanned: ${res.scannedPosts.toLocaleString()}
+- Comments Scanned: ${res.scannedComments.toLocaleString()}
+- Quarantined Posts: ${res.quarantinedPosts.toLocaleString()}
+- Quarantined Comments: ${res.quarantinedComments.toLocaleString()}
+- Audit Report Written To: \`${res.reportPath}\``,
+      ),
+    )
+  },
+})
+
 // Write tools (require user authentication)
 server.addTool({
   name: "create_post",

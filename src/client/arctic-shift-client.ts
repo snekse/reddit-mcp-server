@@ -4,7 +4,7 @@
  * `throw`s are local control flow captured by that `Try` and never escape the method.
  */
 import type { Either } from "functype"
-import { Option, Try } from "functype"
+import { Option, Right, Try } from "functype"
 
 import type {
   Page,
@@ -19,9 +19,11 @@ import type {
   RedditSubreddit,
   RedditUser,
 } from "../types"
+import type { QuarantinedItemRecord } from "../utils/content-scanner"
 import { normalizeSubreddit, normalizeThingId, normalizeUsername } from "../utils/reddit-identifiers"
 import type { RedditError } from "./errors"
 import { ApiError, classifyRedditError, HttpError, NotFoundError, ValidationError } from "./errors"
+import type { LocalArchiveStore, SubredditSyncStats } from "./local-archive"
 import {
   collectMoreIds,
   parseCommentData,
@@ -35,25 +37,27 @@ import type { ResponseCache } from "./response-cache"
 
 /**
  * Keyless read backend over the Arctic Shift archive (https://github.com/ArthurHeitmann/arctic_shift),
- * a free third-party Reddit archive. It is not Reddit's API:
- * - It sorts only by creation date, so there is no hot/top/rising ranking and no home feed.
- * - Scores and comment counts are captured at ingest and lag (often 0 or 1 on recent posts).
- * - Coverage can be incomplete, especially for comments on recent posts.
- * - Keyword search needs a subreddit or author; multireddits (`a+b`) are not supported.
- * Pagination walks backward in time: the `after` cursor is the created_utc of the last item.
+ * a free third-party Reddit archive, paired with an optional local SQLite FTS5 cache.
  */
 const BASE_URL = "https://arctic-shift.photon-reddit.com/api"
 const MAX_LIMIT = 100
 const MAX_COMMENT_TREE_LIMIT = 500
 const ERROR_TEXT_MAX_LENGTH = 200
 const CURSOR_PATTERN = /^\d{9,10}$/
-// Arctic answers 429, or "Timeout. Maybe slow down a bit", when it is throttling (keyword
-// search especially). Its X-RateLimit-Reset header gives seconds until the window resets, but
-// the limit is load-based and a retry usually succeeds well before that, so the wait is capped.
+
 export type ThrottleDelays = { readonly fallbackMs: number; readonly maxWaitMs: number }
 const THROTTLE_DELAYS: ThrottleDelays = { fallbackMs: 3_000, maxWaitMs: 10_000 }
 
-// How long to wait before the one retry: the header's reset time, capped; else the fallback.
+export type SyncSubredditResult = {
+  readonly subreddit: string
+  readonly mode: "incremental" | "recent"
+  readonly postsIngested: number
+  readonly commentsIngested: number
+  readonly quarantinedCount: number
+  readonly flaggedItems: readonly QuarantinedItemRecord[]
+  readonly stats?: SubredditSyncStats
+}
+
 export function throttleWaitMs(resetSeconds: Option<number>, delays: ThrottleDelays): number {
   return resetSeconds.fold(
     () => delays.fallbackMs,
@@ -61,8 +65,6 @@ export function throttleWaitMs(resetSeconds: Option<number>, delays: ThrottleDel
   )
 }
 
-// The reset header rides on every response and only marks the next minute boundary, so it is
-// advice for a real 429. A query timeout usually clears in seconds.
 function throttleMessage(status: number, resetSeconds: Option<number>): string {
   if (status !== 429) {
     return "Arctic Shift timed out on this query, which it does under load. Wait a few seconds and retry; keyword searches on large subreddits are slowest."
@@ -73,7 +75,6 @@ function throttleMessage(status: number, resetSeconds: Option<number>): string {
   )
 }
 
-// X-RateLimit-Reset is whole seconds until the limit resets; absent or malformed means unknown.
 function resetSecondsOf(headers: Headers): Option<number> {
   return Option(headers.get("x-ratelimit-reset"))
     .filter((raw) => raw.trim() !== "")
@@ -109,7 +110,6 @@ function clampLimit(limit: number, max: number = MAX_LIMIT): number {
   return Math.min(Math.max(Math.trunc(limit), 1), max)
 }
 
-// Arctic Shift has no home feed and no multireddits; require exactly one named subreddit.
 function singleSubreddit(subreddit: string): string {
   const name = normalizeSubreddit(subreddit)
   if (name === "") {
@@ -125,18 +125,24 @@ function singleSubreddit(subreddit: string): string {
   return name
 }
 
-// True for a cursor this client issued (a created_utc in seconds), false for e.g. an RSS fullname.
 export function isArchiveCursor(after: string): boolean {
   return CURSOR_PATTERN.test(after)
 }
 
-// Arctic's `after` accepts offsets from now, so Reddit's time filters map directly.
 const TIME_FILTER_OFFSETS: Readonly<Record<string, string>> = {
   hour: "1hour",
   day: "1d",
   week: "7d",
   month: "30d",
   year: "365d",
+}
+
+const TIME_FILTER_SECONDS: Readonly<Record<string, number>> = {
+  hour: 3600,
+  day: 86400,
+  week: 7 * 86400,
+  month: 30 * 86400,
+  year: 365 * 86400,
 }
 
 function cursorParam(after?: string): Record<string, string> {
@@ -149,8 +155,6 @@ function cursorParam(after?: string): Record<string, string> {
   return { before: after }
 }
 
-// A full page means there may be more; the cursor is the oldest item's timestamp. Arctic's
-// `before` is exclusive, so the next page starts just past it.
 function pageOf<T extends { readonly createdUtc: number }>(items: readonly T[], limit: number): Page<T> {
   const last = items.at(-1)
   const after = items.length >= limit && last !== undefined ? { after: String(last.createdUtc) } : {}
@@ -161,18 +165,23 @@ export class ArcticShiftClient {
   private readonly userAgent: string
   private readonly cache?: ResponseCache
   private readonly throttleDelays: ThrottleDelays
+  private readonly archive?: LocalArchiveStore
 
-  constructor(userAgent: string, cache?: ResponseCache, throttleDelays: ThrottleDelays = THROTTLE_DELAYS) {
+  constructor(
+    userAgent: string,
+    cache?: ResponseCache,
+    throttleDelays: ThrottleDelays = THROTTLE_DELAYS,
+    archive?: LocalArchiveStore,
+  ) {
     this.userAgent = userAgent
     this.cache = cache
     this.throttleDelays = throttleDelays
+    this.archive = archive
   }
 
-  // GET an Arctic Shift endpoint and return its `data`. Throws a typed RedditError on failure.
   private async request<T>(path: string, params: Record<string, string>, retried: boolean = false): Promise<T> {
     const url = `${BASE_URL}${path}?${new URLSearchParams(params)}`
     const cached = this.cache?.get(url)
-    // Only successes are cached, so a cached entry never needs its rate-limit headers.
     const { status, body, resetSeconds } =
       cached !== undefined ? { ...cached, resetSeconds: Option.none<number>() } : await this.fetchBody(url)
 
@@ -209,13 +218,28 @@ export class ArcticShiftClient {
   ): Promise<Either<RedditError, Page<RedditPost>>> {
     const context = `Failed to list r/${subreddit} from the Arctic Shift archive`
     const attempt = await Try.async(async (): Promise<Page<RedditPost>> => {
+      const sub = singleSubreddit(subreddit)
       const size = clampLimit(limit)
+      const cursor = cursorParam(after)
+
+      if (this.archive?.hasSubreddit(sub) === true) {
+        const localPage = this.archive.listSubredditPosts(
+          sub,
+          size,
+          cursor["before"] !== undefined ? Number(cursor["before"]) : undefined,
+        )
+        if (localPage.items.length > 0) return localPage
+      }
+
       const posts = await this.request<readonly RedditApiPostData[]>("/posts/search", {
-        subreddit: singleSubreddit(subreddit),
+        subreddit: sub,
         sort: "desc",
         limit: String(size),
-        ...cursorParam(after),
+        ...cursor,
       })
+      if (this.archive !== undefined && posts.length > 0) {
+        this.archive.upsertPosts(sub, posts)
+      }
       return pageOf(posts.map(parsePostData), size)
     })
     return attempt.toEither((error) => classifyRedditError(error, context))
@@ -232,6 +256,7 @@ export class ArcticShiftClient {
   ): Promise<Either<RedditError, Page<RedditPost>>> {
     const { subreddit, limit = 25, after, timeFilter } = options
     const since = timeFilter !== undefined ? TIME_FILTER_OFFSETS[timeFilter] : undefined
+    const sinceSeconds = timeFilter !== undefined ? TIME_FILTER_SECONDS[timeFilter] : undefined
     const context = `Failed to search the Arctic Shift archive for: ${query}`
     const attempt = await Try.async(async (): Promise<Page<RedditPost>> => {
       if (subreddit === undefined) {
@@ -239,21 +264,191 @@ export class ArcticShiftClient {
           "Keyless search needs a subreddit: the Arctic Shift archive cannot search all of Reddit. Pass `subreddit`.",
         )
       }
+      const sub = singleSubreddit(subreddit)
       const size = clampLimit(limit)
+      const cursor = cursorParam(after)
+
+      if (this.archive?.hasSubreddit(sub) === true) {
+        const localPage = this.archive.searchPosts(query, {
+          subreddit: sub,
+          limit: size,
+          beforeUtc: cursor["before"] !== undefined ? Number(cursor["before"]) : undefined,
+          sinceUtc: sinceSeconds !== undefined ? Math.floor(Date.now() / 1000) - sinceSeconds : undefined,
+        })
+        if (localPage.items.length > 0) return localPage
+      }
+
       const posts = await this.request<readonly RedditApiPostData[]>("/posts/search", {
-        subreddit: singleSubreddit(subreddit),
+        subreddit: sub,
         query,
         ...(since !== undefined ? { after: since } : {}),
         sort: "desc",
         limit: String(size),
-        ...cursorParam(after),
+        ...cursor,
       })
+      if (this.archive !== undefined && posts.length > 0) {
+        this.archive.upsertPosts(sub, posts)
+      }
       return pageOf(posts.map(parsePostData), size)
     })
     return attempt.toEither((error) => classifyRedditError(error, context))
   }
 
-  // Subreddit search by name prefix (Arctic has no description search). Ordered by subscribers.
+  async searchComments(
+    query: string,
+    options: {
+      readonly subreddit?: string
+      readonly author?: string
+      readonly limit?: number
+      readonly after?: string
+      readonly timeFilter?: string
+    } = {},
+  ): Promise<Either<RedditError, Page<RedditComment>>> {
+    const { subreddit, author, limit = 25, after, timeFilter } = options
+    const since = timeFilter !== undefined ? TIME_FILTER_OFFSETS[timeFilter] : undefined
+    const sinceSeconds = timeFilter !== undefined ? TIME_FILTER_SECONDS[timeFilter] : undefined
+    const context = `Failed to search comments in the Arctic Shift archive for: ${query}`
+    const attempt = await Try.async(async (): Promise<Page<RedditComment>> => {
+      if (subreddit === undefined && author === undefined) {
+        throw new ValidationError(
+          "Comment search requires a `subreddit` or `author`: the Arctic Shift archive cannot search comments across all of Reddit.",
+        )
+      }
+      const sub = subreddit !== undefined ? singleSubreddit(subreddit) : undefined
+      const cleanAuthor = author !== undefined ? normalizeUsername(author) : undefined
+      const size = clampLimit(limit)
+      const cursor = cursorParam(after)
+
+      if (sub !== undefined && this.archive?.hasSubreddit(sub) === true) {
+        const localPage = this.archive.searchComments(query, {
+          subreddit: sub,
+          author: cleanAuthor,
+          limit: size,
+          beforeUtc: cursor["before"] !== undefined ? Number(cursor["before"]) : undefined,
+          sinceUtc: sinceSeconds !== undefined ? Math.floor(Date.now() / 1000) - sinceSeconds : undefined,
+        })
+        if (localPage.items.length > 0) return localPage
+      }
+
+      const comments = await this.request<readonly RedditApiCommentTreeData[]>("/comments/search", {
+        ...(sub !== undefined ? { subreddit: sub } : {}),
+        ...(cleanAuthor !== undefined ? { author: cleanAuthor } : {}),
+        body: query,
+        ...(since !== undefined ? { after: since } : {}),
+        sort: "desc",
+        limit: String(size),
+        ...cursor,
+      })
+      if (this.archive !== undefined && sub !== undefined && comments.length > 0) {
+        this.archive.upsertComments(sub, comments)
+      }
+      return pageOf(
+        comments.map((comment) => parseCommentData(comment)),
+        size,
+      )
+    })
+    return attempt.toEither((error) => classifyRedditError(error, context))
+  }
+
+  async syncSubreddit(
+    subreddit: string,
+    options: {
+      readonly maxPostPages?: number
+      readonly maxCommentPages?: number
+      readonly mode?: "incremental" | "recent"
+    } = {},
+  ): Promise<Either<RedditError, SyncSubredditResult>> {
+    const context = `Failed to sync r/${subreddit} from the Arctic Shift archive`
+    const attempt = await Try.async(async (): Promise<SyncSubredditResult> => {
+      if (this.archive === undefined) {
+        throw new ApiError("Local SQLite archive is not initialized")
+      }
+      const sub = singleSubreddit(subreddit)
+      const maxPostPages = Math.min(Math.max(options.maxPostPages ?? 3, 1), 25)
+      const maxCommentPages = Math.min(Math.max(options.maxCommentPages ?? 5, 1), 50)
+      const existing = this.archive.getSubredditSyncState(sub)
+      const mode = options.mode ?? (existing !== undefined && existing.lastPostUtc > 0 ? "incremental" : "recent")
+
+      let postsIngested = 0
+      let commentsIngested = 0
+      let quarantinedCount = 0
+      const flaggedItems: QuarantinedItemRecord[] = []
+
+      // 1. Sync posts (limit=100 per Arctic Shift hard cap)
+      let postCursor: string | undefined =
+        mode === "incremental" && existing !== undefined && existing.lastPostUtc > 0
+          ? String(existing.lastPostUtc)
+          : undefined
+
+      for (let page = 0; page < maxPostPages; page += 1) {
+        const params: Record<string, string> = {
+          subreddit: sub,
+          limit: "100",
+          sort: mode === "incremental" ? "asc" : "desc",
+          ...(postCursor !== undefined
+            ? mode === "incremental"
+              ? { after: postCursor }
+              : { before: postCursor }
+            : {}),
+        }
+        const batch = await this.request<readonly RedditApiPostData[]>("/posts/search", params)
+        if (batch.length === 0) break
+
+        const summary = this.archive.upsertPosts(sub, batch)
+        postsIngested += summary.ingested
+        quarantinedCount += summary.quarantined
+        flaggedItems.push(...summary.flaggedItems)
+
+        if (batch.length < 100) break
+        const boundaryPost = batch.at(-1)
+        if (boundaryPost === undefined) break
+        postCursor = String(boundaryPost.created_utc)
+      }
+
+      // 2. Sync comments (limit=100 per Arctic Shift hard cap)
+      let commentCursor: string | undefined =
+        mode === "incremental" && existing !== undefined && existing.lastCommentUtc > 0
+          ? String(existing.lastCommentUtc)
+          : undefined
+
+      for (let page = 0; page < maxCommentPages; page += 1) {
+        const params: Record<string, string> = {
+          subreddit: sub,
+          limit: "100",
+          sort: mode === "incremental" ? "asc" : "desc",
+          ...(commentCursor !== undefined
+            ? mode === "incremental"
+              ? { after: commentCursor }
+              : { before: commentCursor }
+            : {}),
+        }
+        const batch = await this.request<readonly RedditApiCommentTreeData[]>("/comments/search", params)
+        if (batch.length === 0) break
+
+        const summary = this.archive.upsertComments(sub, batch)
+        commentsIngested += summary.ingested
+        quarantinedCount += summary.quarantined
+        flaggedItems.push(...summary.flaggedItems)
+
+        if (batch.length < 100) break
+        const boundaryComment = batch.at(-1)
+        if (boundaryComment === undefined) break
+        commentCursor = String(boundaryComment.created_utc)
+      }
+
+      return {
+        subreddit: sub,
+        mode,
+        postsIngested,
+        commentsIngested,
+        quarantinedCount,
+        flaggedItems,
+        stats: this.archive.getSubredditSyncState(sub),
+      }
+    })
+    return attempt.toEither((error) => classifyRedditError(error, context))
+  }
+
   async searchSubreddits(query: string, limit: number = 25): Promise<Either<RedditError, Page<RedditPost>>> {
     const context = `Failed to search subreddits in the Arctic Shift archive for: ${query}`
     const attempt = await Try.async(async (): Promise<Page<RedditPost>> => {
@@ -279,15 +474,28 @@ export class ArcticShiftClient {
   }
 
   private async fetchPost(postId: string): Promise<RedditPost> {
-    const posts = await this.request<readonly RedditApiPostData[]>("/posts/ids", { ids: normalizeThingId(postId) })
+    const id = normalizeThingId(postId)
+    const localPost = this.archive?.getPost(id)
+    if (localPost !== undefined) return localPost
+
+    const posts = await this.request<readonly RedditApiPostData[]>("/posts/ids", { ids: id })
     const post = posts.at(0)
     if (post === undefined) {
       throw new NotFoundError(`Post ${postId} is not in the Arctic Shift archive`)
+    }
+    if (this.archive !== undefined && post.subreddit !== "") {
+      this.archive.upsertPosts(post.subreddit, [post])
     }
     return parsePostData(post)
   }
 
   async getPostComments(postId: string, limit: number = 100): Promise<Either<RedditError, PostComments>> {
+    const id = normalizeThingId(postId)
+    const localThread = this.archive?.getPostComments(id, clampLimit(limit, MAX_COMMENT_TREE_LIMIT))
+    if (localThread !== undefined && localThread.comments.length > 0) {
+      return Right(localThread)
+    }
+
     const context = `Failed to get comments for post ${postId} from the Arctic Shift archive`
     const attempt = await Try.async(async () => {
       const post = await this.fetchPost(postId)
@@ -300,7 +508,6 @@ export class ArcticShiftClient {
     return attempt.toEither((error) => classifyRedditError(error, context))
   }
 
-  // Expand "load more" stubs by fetching the collapsed comments directly by id.
   async getComments(commentIds: readonly string[]): Promise<Either<RedditError, readonly RedditComment[]>> {
     const context = "Failed to expand comments from the Arctic Shift archive"
     const attempt = await Try.async(async (): Promise<readonly RedditComment[]> => {
@@ -312,8 +519,6 @@ export class ArcticShiftClient {
     return attempt.toEither((error) => classifyRedditError(error, context))
   }
 
-  // Arctic keeps aggregate stats only: karma and first-seen activity. Account creation date and
-  // mod/gold/employee flags are unknown, so createdUtc is the earliest archived post or comment.
   async getUser(username: string): Promise<Either<RedditError, RedditUser>> {
     const context = `Failed to get user ${username} from the Arctic Shift archive`
     const attempt = await Try.async(async (): Promise<RedditUser> => {

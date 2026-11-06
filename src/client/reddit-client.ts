@@ -44,8 +44,11 @@ import type {
   UserContent,
 } from "../types"
 import { normalizeFullname, normalizeSubreddit, normalizeThingId, normalizeUsername } from "../utils/reddit-identifiers"
+import type { SyncSubredditResult } from "./arctic-shift-client"
 import { ArcticShiftClient, isArchiveCursor } from "./arctic-shift-client"
 import type { RedditError } from "./errors"
+import type { ArchiveStatusSummary } from "./local-archive"
+import { LocalArchiveStore } from "./local-archive"
 import {
   ApiError,
   classifyRedditError,
@@ -97,6 +100,7 @@ export class RedditClient {
   private readonly cache?: ResponseCache
   private readonly retry: RetryConfig
   private readonly rssClient: RssClient
+  private readonly archive?: LocalArchiveStore
   private readonly arctic: ArcticShiftClient
   // No OAuth credentials: reads go to RSS (ranked listings) and the Arctic Shift archive.
   readonly keyless: boolean
@@ -138,7 +142,9 @@ export class RedditClient {
     this.retry = config.retry ?? { maxRetries: 3, baseDelayMs: 1000, maxDelayMs: 60000 }
     this.keyless = this.authMode === "anonymous" || (this.authMode === "auto" && !this.hasCredentials)
     this.rssClient = new RssClient(this.userAgent)
-    this.arctic = new ArcticShiftClient(this.userAgent, this.cache)
+    const isTestEnv = process.env["VITEST"] === "true" || process.env["NODE_ENV"] === "test"
+    this.archive = !isTestEnv || process.env["REDDIT_ARCHIVE_DB"] !== undefined ? new LocalArchiveStore() : undefined
+    this.arctic = new ArcticShiftClient(this.userAgent, this.cache, undefined, this.archive)
   }
 
   private determineBaseUrl(): string {
@@ -1100,6 +1106,55 @@ export class RedditClient {
     })
 
     return attempt.toEither((error) => classifyRedditError(error, context))
+  }
+
+  async searchComments(
+    query: string,
+    options: {
+      readonly subreddit?: string
+      readonly author?: string
+      readonly timeFilter?: string
+      readonly limit?: number
+      readonly after?: string
+    } = {},
+  ): Promise<Either<RedditError, Page<RedditComment>>> {
+    return this.arctic.searchComments(query, options)
+  }
+
+  async syncSubredditArchive(
+    subreddit: string,
+    options: {
+      readonly maxPostPages?: number
+      readonly maxCommentPages?: number
+      readonly mode?: "incremental" | "recent"
+    } = {},
+  ): Promise<Either<RedditError, SyncSubredditResult>> {
+    return this.arctic.syncSubreddit(subreddit, options)
+  }
+
+  getArchiveStatus(): Either<RedditError, ArchiveStatusSummary> {
+    const attempt = Try((): ArchiveStatusSummary => {
+      const store = this.archive ?? new LocalArchiveStore()
+      return store.getStatus()
+    })
+    return attempt.toEither((error) => classifyRedditError(error, "Failed to read local SQLite archive status"))
+  }
+
+  rescanArchive(): Either<
+    RedditError,
+    {
+      readonly scannedPosts: number
+      readonly scannedComments: number
+      readonly quarantinedPosts: number
+      readonly quarantinedComments: number
+      readonly reportPath: string
+    }
+  > {
+    const attempt = Try(() => {
+      const store = this.archive ?? new LocalArchiveStore()
+      return store.rescanAll()
+    })
+    return attempt.toEither((error) => classifyRedditError(error, "Failed to scan local SQLite archive"))
   }
 
   async getPostComments(

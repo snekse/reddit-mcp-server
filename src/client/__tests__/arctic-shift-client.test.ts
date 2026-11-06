@@ -373,6 +373,28 @@ describe("ArcticShiftClient", () => {
     })
   })
 
+  describe("searchComments", () => {
+    it("requires a subreddit or author", async () => {
+      const result = await arctic.searchComments("TIP102")
+
+      expect(result.swap().orThrow()._tag).toBe("ValidationError")
+      expect(mockFetch).not.toHaveBeenCalled()
+    })
+
+    it("searches comment bodies within a subreddit", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse(fixture("comments-search")))
+
+      const page = (await arctic.searchComments("TIP102", { subreddit: "pinballrepair", limit: 2 })).orThrow()
+
+      expect(page.source).toBe("arctic")
+      expect(page.items).toHaveLength(2)
+      const url = calledUrl(mockFetch)
+      expect(url.pathname).toBe("/api/comments/search")
+      expect(url.searchParams.get("body")).toBe("TIP102")
+      expect(url.searchParams.get("subreddit")).toBe("pinballrepair")
+    })
+  })
+
   describe("searchSubreddits", () => {
     it("searches by name prefix", async () => {
       mockFetch.mockResolvedValueOnce(jsonResponse(fixture("subreddits-prefix")))

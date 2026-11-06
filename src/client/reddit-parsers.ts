@@ -56,6 +56,7 @@ export function parseCommentData(
     permalink: comment.permalink,
     ...(depth !== undefined ? { depth } : {}),
     parentId: comment.parent_id,
+    ...(comment.link_id !== undefined ? { linkId: comment.link_id } : {}),
   }
 }
 
